@@ -3,7 +3,10 @@ import queue
 import uuid
 from collections import defaultdict
 from typing import Any, Dict, Optional
-
+import requests
+import json
+import re
+import os
 from fastapi import Request
 
 from ..core import Connection, Session, QueryResult
@@ -78,22 +81,56 @@ class Context:
                 use_target += f".{schema}"
             else:
                 use_target = schema
-        if use_target:
-            self._sess.execute_sql(f"USE {use_target}")
+        # if use_target:
+        #     self._sess.execute_sql(f"USE {use_target}")
 
     def execute_sql(self, sql: str) -> QueryResult:
         logger.debug(f"TXN %s: %s", self.txn_id, sql)
+        boiling_search_terms = [
+            "'s3://",
+            "glue('",
+            "glue ('",
+            "list('",
+            "list ('",
+            "share('",
+            "share ('",
+            "boilingdata",
+            "boilingshares",
+        ]
+        txn_id = str(uuid.uuid4())
+        resp_filename = ""
+        if any(term in sql.lower() for term in boiling_search_terms):
+            # Send the SQL to BD HTTP local proxy on port 3100
+            logger.info("---------------- BoilingData Interception -----------------")
+            pattern = r"CREATE\s*TABLE\s*([a-zA-Z0-9\._]+)\s*AS\s*"
+            match = re.search(pattern, sql, re.DOTALL)
+            results_tbl = match.group(1) if match else "tmpResults"
+            sql = re.sub(pattern, "", sql, flags=re.DOTALL)
+            logger.info("outgoing SQL\n", sql)
+            url = "http://boilingdata_http_gw:3100/"
+            response = requests.post(url, json={"statement": sql, "requestId": txn_id})
+            resp_filename = f"/dev/shm/bd_resp_{txn_id}.json"
+            with open(resp_filename, "wb") as outfile:
+                outfile.write(response.content)
+            self._sess.execute_sql(
+                f"""
+                DROP TABLE IF EXISTS tmpResults; 
+                CREATE TABLE {results_tbl} AS SELECT * FROM read_json_auto('{resp_filename}')
+                """
+            )
+            sql = f"SELECT * FROM {results_tbl}"
         qr = self._sess.execute_sql(sql)
         ends_in_txn = self._sess.in_transaction()
         logger.debug("FINISH IN TXN: %s", ends_in_txn)
         if not self.txn_id and ends_in_txn:
-            self.txn_id = str(uuid.uuid4())
+            self.txn_id = txn_id
             self.h.set("Started-Transaction-Id", self.txn_id)
             logger.debug("Set txn id to %s", self.txn_id)
         elif self.txn_id and not ends_in_txn:
             self.h.set("Clear-Transaction-Id", self.txn_id)
             logger.debug("Cleared transaction id from %s", self.txn_id)
             self.txn_id = None
+        os.unlink(resp_filename) if resp_filename != "" else None
         return qr
 
     def close(self):

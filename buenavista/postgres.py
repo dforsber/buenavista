@@ -8,6 +8,9 @@ import random
 import socketserver
 import struct
 from typing import Dict, List, Optional
+import requests
+import uuid
+import re
 
 from .core import BVType, Connection, Extension, Session, QueryResult
 from .rewrite import Rewriter
@@ -208,12 +211,46 @@ class BVContext:
         if self.rewriter:
             sql = self.rewriter.rewrite(sql)
             logger.info("Rewritten SQL: " + sql)
+        boiling_search_terms = [
+            "'s3://",
+            "glue('",
+            "glue ('",
+            "list('",
+            "list ('",
+            "share('",
+            "share ('",
+            "boilingdata",
+            "boilingshares",
+        ]
+        txn_id = str(uuid.uuid4())
+        resp_filename = ""
+        if any(term in sql.lower() for term in boiling_search_terms):
+            # Send the SQL to BD HTTP local proxy on port 3100
+            logger.info("---------------- BoilingData Interception -----------------")
+            pattern = r"CREATE\s*TABLE\s*([a-zA-Z0-9\._]+)\s*AS\s*"
+            match = re.search(pattern, sql, re.DOTALL)
+            results_tbl = match.group(1) if match else "tmpResults"
+            sql = re.sub(pattern, "", sql, flags=re.DOTALL)
+            logger.info("outgoing SQL\n", sql)
+            url = "http://boilingdata_http_gw:3100/"
+            response = requests.post(url, json={"statement": sql, "requestId": txn_id})
+            resp_filename = f"/dev/shm/bd_resp_{txn_id}.json"
+            with open(resp_filename, "wb") as outfile:
+                outfile.write(response.content)
+            self._sess.execute_sql(
+                f"""
+                DROP TABLE IF EXISTS tmpResults; 
+                CREATE TABLE {results_tbl} AS SELECT * FROM read_json_auto('{resp_filename}')
+                """
+            )
+            sql = f"SELECT * FROM {results_tbl}"
         qr = self.session.execute_sql(sql, params)
         if qr.has_results():
             if result_fmt and len(result_fmt) != qr.column_count():
                 qr.result_format = [result_fmt[0]] * qr.column_count()
             else:
                 qr.result_format = result_fmt
+        os.unlink(resp_filename) if resp_filename != "" else None
         return qr
 
     def describe_portal(self, name: str) -> QueryResult:
