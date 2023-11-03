@@ -1,3 +1,12 @@
+# Buena Vista with BoilingData
+
+This fork intercepts SQL Queries between client and local in-process DuckDB instance. Matched SQL statements are relayed to Boiling HTTP Proxy.
+
+For example any query containing `parquet_scan` will actually be run on [BoilingData](https://www.boilingdata.com/). Similarly, `CREATE TABLE myTable AS SELECT ... parquet_scan...` will create a local in-process DuckDB instance table from BoilingData query results computed on the cloud side.
+
+You need to run the [BoilingData HTTP gateway](https://github.com/boilingdata/boilingdata-http-gw) that takes care of establishing and maintaining authenticated and secure connection to BoilingData.
+
+-------------------------------------- `Original README` -----------------------------------------
 # Buena Vista: A Programmable Postgres Proxy Server
 
 Buena Vista is a Python library that provides a [socketserver](https://docs.python.org/3/library/socketserver.html)-based implementation
