@@ -4,14 +4,17 @@ import uuid
 from collections import defaultdict
 from typing import Any, Dict, Optional
 import requests
-import json
 import re
 import os
 from fastapi import Request
+import sqlglot
 
 from ..core import Connection, Session, QueryResult
 
 logger = logging.getLogger(__name__)
+
+BD_CAT = "CREATE TABLE IF NOT EXISTS __bd_prepared_statements (key VARCHAR, st VARCHAR)"
+BD_URL = "http://boilingdata_http_gw:3100/"
 
 
 class Headers:
@@ -84,8 +87,127 @@ class Context:
         # if use_target:
         #     self._sess.execute_sql(f"USE {use_target}")
 
-    def execute_sql(self, sql: str) -> QueryResult:
-        logger.debug(f"TXN %s: %s", self.txn_id, sql)
+    ## Initial setup, create inmem boilingdata database and fetch Boiling catalog into it
+    ## - DuckDB in-mem table is used by all connections, so we get Boiling Catalog only once
+    def populate_boiling_catalog(self, txn_id):
+        qr = self._sess.execute_sql("SHOW DATABASES;")
+        for db in qr.rows():
+            if db[0] == "boilingdata":
+                return
+        try:
+            self._sess.execute_sql("ATTACH ':memory:' AS boilingdata;")
+            self._sess.execute_sql("SET search_path='memory,boilingdata';")
+        except:
+            None
+        try:
+            print("---------------- BOILING POPULATE -----------------")
+            # We could stick to the information_schema API but for now Boiling
+            # handles the "CREATE TABLE" statements on server side for you.
+            q = "SELECT * FROM information_schema.create_tables_statements"
+            data = {"statement": q, "requestId": txn_id}
+            response = requests.post(BD_URL, json=data)
+            stmts = response.json()
+            for stmt in stmts:
+                print(f"\t{stmt}")
+                self._sess.execute_sql(stmt)
+        except:
+            None
+
+    ## information_schema
+    def misc_sql_mangling(self, sql):
+        sql = sql.replace("CURRENT_TIMESTAMP()", "CURRENT_TIMESTAMP")
+        sql = sql.replace(":%S.%f%z", ":%S.%g%z")  # Fix timestamp format for Metabase
+        sql = sql.replace(
+            "WHERE catalog_name = '\"boilingdata\"'",
+            "WHERE catalog_name = 'boilingdata'",
+        )
+        sql = sql.replace('\'"boilingdata".', "'")
+        sql = re.sub(
+            r"WHERE table_schema = '\"(.+?)\"'",
+            r"WHERE table_schema = '\1'",
+            sql,
+        )
+        # hide internal table
+        t = "SELECT DISTINCT table_name as Table from information_schema.tables WHERE table_schema ="
+        if t in sql:
+            sql = f"{sql} AND table_name NOT LIKE '__bd_%'"
+        # use information schema: DESCRIBE --> SELECT
+        sql = re.sub(
+            r"DESCRIBE \"(.+?)\"\.\"(.+?)\"\.\"(.+?)\"",
+            r"SELECT column_name, data_type AS column_type, is_nullable AS null, '' AS key, column_default AS default, NULL AS extra FROM information_schema.columns WHERE table_catalog = '\1' AND table_schema = '\2' AND table_name = '\3';",
+            sql,
+        )
+        sql = sql.replace(
+            "SHOW SCHEMAS FROM", "SELECT * FROM information_schema.schemata"
+        )
+        sql = sql.replace(" USING ", " ")
+        return sql
+
+    def is_boiling_deallocate(self, sql):
+        pattern = r"DEALLOCATE\s+PREPARE\s+([a-zA-Z0-9]+)\s*"
+        match = re.search(pattern, sql, re.DOTALL)
+        stmt = match.group(1) if match else "notResolved"
+        if stmt != "notResolved":
+            q = f"{BD_CAT}; DELETE FROM __bd_prepared_statements WHERE key = '{stmt}';"
+            self._sess.execute_sql(q)
+            return True
+        return False
+
+    def is_boiling_execute(self, sql):
+        pattern = r"EXECUTE\s+([a-zA-Z0-9\._]+)\s+USING\s+"
+        match = re.search(pattern, sql, re.DOTALL)
+        stmtName = match.group(1) if match else "notResolved"
+        if stmtName == "notResolved":
+            return None
+        q = f"{BD_CAT}; SELECT * FROM __bd_prepared_statements"
+        bd_prepared_stmts = self._sess.execute_sql(q).rows()
+        logger.debug(f"---------------- PREPARED LIST ({stmtName})-----------------")
+        for stmt in bd_prepared_stmts:
+            if stmt[0] == stmtName:
+                arguments = re.sub(pattern, "", sql, flags=re.DOTALL).split(",")
+                _sql = stmt[1]
+                for arg in arguments:
+                    _sql = _sql.replace("?", arg, 1)
+                logger.debug(f"\t{_sql}")
+                return _sql
+        return None
+
+    def is_boiling_intercept(self, sql):
+        logger.debug("---------------- is_boiling_intercept? -----------------")
+        ## 0) Is prepared statement for Boiling?
+        if self.is_boiling_deallocate(sql):
+            return False
+        prepared = self.is_boiling_execute(sql)
+        if prepared is not None:
+            # print("\t YES")
+            return prepared
+        ## 1) Get all Boiling tables so we know what to intercept
+        q = "SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'boilingdata';"
+        boiling_tables = self._sess.execute_sql(q).rows()
+        for table in boiling_tables:
+            # print(f"\t{table[0]}.{table[1]}")
+            if (
+                sql
+                and table[0] in sql
+                and table[1] in sql
+                and "SELECT column_name, data_type AS column_type, is_nullable AS null"
+                not in sql
+            ):
+                ## Store prepared statements for our own use
+                if "PREPARE " in sql:
+                    sqlstr = re.sub(r"(?<!')'(?!')", "''", sql)
+                    pattern = r"PREPARE\s+([a-zA-Z0-9\._]+)\s+(FROM|AS)\s+"
+                    match = re.search(pattern, sql, re.DOTALL)
+                    stmtName = match.group(1) if match else "notResolved"
+                    logger.debug("---------------- NEW PREPARED -----------------")
+                    q = f"{BD_CAT}; INSERT INTO __bd_prepared_statements VALUES ('{stmtName}', '{sqlstr}');"
+                    logger.debug(q)
+                    self._sess.execute_sql(q)
+                    # print("\t NO")
+                    return "SELECT 1;"  # nop
+                # print("\t YES")
+                return True
+        ## 2) static words
         boiling_search_terms = [
             "'s3://",
             "glue('",
@@ -97,18 +219,39 @@ class Context:
             "boilingdata",
             "boilingshares",
         ]
+        __sql = sql.lower().replace('"', "")
+        if (
+            not sql.lower().startswith("prepare ")
+            and not "information_schema" in sql.lower()
+            and any(term in __sql for term in boiling_search_terms)
+        ):
+            # print("\t YES")
+            return True
+        # print("\t NO")
+        return False
+
+    def execute_sql(self, sql: str) -> QueryResult:
+        logger.debug(f"TXN %s: %s", self.txn_id, sql)
         txn_id = str(uuid.uuid4())
-        resp_filename = ""
-        if any(term in sql.lower() for term in boiling_search_terms):
+        self.populate_boiling_catalog(txn_id)
+        sql = self.misc_sql_mangling(sql)
+        resp_filename = None
+        is_bd = self.is_boiling_intercept(sql)
+        if isinstance(is_bd, str):
+            sql = is_bd
+        if is_bd and is_bd != "SELECT 1;":
             # Send the SQL to BD HTTP local proxy on port 3100
-            logger.info("---------------- BoilingData Interception -----------------")
-            pattern = r"CREATE\s*TABLE\s*([a-zA-Z0-9\._]+)\s*AS\s*"
+            # Boiling speaks PostgreSQL for now
+            sql = sqlglot.transpile(sql, read="duckdb", write="postgres")[0]
+            sql = sql.replace("pg_catalog.", "")
+            pattern = r"CREATE\s+TABLE\s+([a-zA-Z0-9\._]+)\s*AS\s*"
             match = re.search(pattern, sql, re.DOTALL)
             results_tbl = match.group(1) if match else "tmpResults"
             sql = re.sub(pattern, "", sql, flags=re.DOTALL)
-            logger.info("outgoing SQL\n", sql)
-            url = "http://boilingdata_http_gw:3100/"
-            response = requests.post(url, json={"statement": sql, "requestId": txn_id})
+            logger.debug("---------------- BoilingData Query -----------------")
+            response = requests.post(
+                BD_URL, json={"statement": sql, "requestId": txn_id}
+            )
             resp_filename = f"/dev/shm/bd_resp_{txn_id}.json"
             with open(resp_filename, "wb") as outfile:
                 outfile.write(response.content)
@@ -130,7 +273,7 @@ class Context:
             self.h.set("Clear-Transaction-Id", self.txn_id)
             logger.debug("Cleared transaction id from %s", self.txn_id)
             self.txn_id = None
-        os.unlink(resp_filename) if resp_filename != "" else None
+        os.unlink(resp_filename) if resp_filename != None else None
         return qr
 
     def close(self):

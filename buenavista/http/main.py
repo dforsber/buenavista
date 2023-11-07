@@ -33,8 +33,8 @@ def quacko(
             "coordinator": True,
             "environment": "buenavista",
             "starting": False,
-            "nodeVersion": {"version": 408},
-            "uptime": f"{uptime_minutes:.2f} minutes",
+            "nodeVersion": {"version": f"0.408"},
+            "uptime": f"{uptime_minutes:.2f}m",
         }
 
     @app.post("/v1/statement")
