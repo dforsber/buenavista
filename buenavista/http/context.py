@@ -246,7 +246,7 @@ class Context:
             sql = sql.replace("pg_catalog.", "")
             pattern = r"CREATE\s+TABLE\s+([a-zA-Z0-9\._]+)\s*AS\s*"
             match = re.search(pattern, sql, re.DOTALL)
-            results_tbl = match.group(1) if match else "tmpResults"
+            results_tbl = match.group(1) if match else "__bd_tmp_results"
             sql = re.sub(pattern, "", sql, flags=re.DOTALL)
             logger.debug("---------------- BoilingData Query -----------------")
             response = requests.post(
@@ -257,7 +257,7 @@ class Context:
                 outfile.write(response.content)
             self._sess.execute_sql(
                 f"""
-                DROP TABLE IF EXISTS tmpResults; 
+                DROP TABLE IF EXISTS __bd_tmp_results; -- default
                 CREATE TABLE {results_tbl} AS SELECT * FROM read_json_auto('{resp_filename}')
                 """
             )
