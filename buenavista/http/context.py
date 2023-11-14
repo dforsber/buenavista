@@ -140,6 +140,10 @@ class Context:
         sql = sql.replace(
             "SHOW SCHEMAS FROM", "SELECT * FROM information_schema.schemata"
         )
+        sql = sql.replace(
+            "SHOW catalogs like '%boilingdata%'",
+            "SELECT * FROM information_schema.schemata WHERE catalog_name LIKE '%boilingdata%'",
+        )
         sql = sql.replace(" USING ", " ")
         return sql
 
@@ -223,6 +227,7 @@ class Context:
         if (
             not sql.lower().startswith("prepare ")
             and not "information_schema" in sql.lower()
+            and not "SHOW catalogs like" in sql
             and any(term in __sql for term in boiling_search_terms)
         ):
             # print("\t YES")
